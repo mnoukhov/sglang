@@ -43,8 +43,8 @@ class LogprobResult:
     """
 
     token_logprobs: Optional[torch.Tensor] = None
-    top_logprobs_val: Optional[List] = None
-    top_logprobs_idx: Optional[List] = None
+    top_logprobs_val: Optional[List | torch.Tensor] = None
+    top_logprobs_idx: Optional[List | torch.Tensor] = None
     token_ids_logprobs_val: Optional[List] = None
     token_ids_logprobs_idx: Optional[List] = None
     input_copy_done: Optional[torch.cuda.Event] = None
@@ -926,11 +926,20 @@ class OutputLogprobProcessor:
         logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
 
         result = LogprobResult()
-        if any(x > 0 for x in top_logprobs_nums):
-            (
-                result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+        top_k = max(top_logprobs_nums, default=0)
+        if top_k > 0:
+            if len(top_logprobs_nums) == logprobs.shape[0] and top_logprobs_nums.count(
+                top_k
+            ) == len(top_logprobs_nums):
+                # Preserve the two dense outputs so overlap scheduling can
+                # copy each whole batch instead of copying every row.
+                result.top_logprobs_val, result.top_logprobs_idx = logprobs.topk(
+                    top_k, dim=-1
+                )
+            else:
+                result.top_logprobs_val, result.top_logprobs_idx = get_top_logprobs(
+                    logprobs, top_logprobs_nums, no_copy_to_cpu=True
+                )
 
         if any(x is not None for x in token_ids_logprobs):
             (
