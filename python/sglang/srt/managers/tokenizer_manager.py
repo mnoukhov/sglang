@@ -318,6 +318,11 @@ class ReqState:
     input_top_logprobs_scheduler_flat: Optional[Tuple[np.ndarray, np.ndarray, int]] = (
         None
     )
+    # return_output_top_logprobs_b64: generated-token top logprobs as dense
+    # (float32 [rows, k], int32 [rows, k]) chunks, encoded once at finish.
+    output_top_logprobs_chunks: List[Tuple[np.ndarray, np.ndarray]] = dataclasses.field(
+        default_factory=list
+    )
 
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -409,6 +414,64 @@ def _build_flat_input_top_logprobs_fields_from_arrays(
     fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
     fields["input_top_logprobs_null_prefix"] = null_prefix
     return fields
+
+
+def _dense_output_top_logprobs_chunk(
+    values, indices, top_logprobs_num: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert one scheduler chunk of output top logprob rows to dense arrays.
+
+    Scheduler chunks are [rows, k] arrays for dense decode batches and nested
+    lists otherwise. Missing or short rows are padded with -inf / -1.
+    """
+    if (
+        isinstance(values, np.ndarray)
+        and values.ndim == 2
+        and values.shape[1] == top_logprobs_num
+    ):
+        return values.astype(np.float32, copy=False), np.asarray(
+            indices, dtype=np.int32
+        )
+    rows = len(values)
+    dense_values = np.full((rows, top_logprobs_num), -np.inf, dtype=np.float32)
+    dense_indices = np.full((rows, top_logprobs_num), -1, dtype=np.int32)
+    for row, (row_values, row_indices) in enumerate(zip(values, indices)):
+        if row_values is None or len(row_values) == 0:
+            continue
+        width = min(len(row_values), top_logprobs_num)
+        dense_values[row, :width] = row_values[:width]
+        dense_indices[row, :width] = row_indices[:width]
+    return dense_values, dense_indices
+
+
+def _is_output_finished(recv_obj, index: int) -> bool:
+    finished_reasons = getattr(recv_obj, "finished_reasons", None)
+    return finished_reasons is None or finished_reasons[index] is not None
+
+
+def _build_output_top_logprobs_b64_fields(
+    chunks: List[Tuple[np.ndarray, np.ndarray]], top_logprobs_num: int
+) -> Dict[str, Any]:
+    """Encode accumulated output top logprob chunks as base64 fields."""
+    if chunks:
+        values = np.concatenate([chunk[0] for chunk in chunks])
+        indices = np.concatenate([chunk[1] for chunk in chunks])
+    else:
+        values = np.empty((0, top_logprobs_num), dtype=np.float32)
+        indices = np.empty((0, top_logprobs_num), dtype=np.int32)
+    values = np.ascontiguousarray(values, dtype="<f4")
+    indices = np.ascontiguousarray(indices, dtype="<i4")
+    return {
+        "output_top_logprobs_val_b64": pybase64.b64encode(values.tobytes()).decode(
+            "utf-8"
+        ),
+        "output_top_logprobs_idx_b64": pybase64.b64encode(indices.tobytes()).decode(
+            "utf-8"
+        ),
+        "output_top_logprobs_val_b64_dtype": "float32",
+        "output_top_logprobs_idx_b64_dtype": "int32",
+        "output_top_logprobs_shape": [values.shape[0], values.shape[1]],
+    }
 
 
 class InputFormat(Enum):
@@ -2783,6 +2846,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         top_logprobs_num: int,
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
+        finished: bool = True,
     ):
         # 1. Handle regular logprobs
         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
@@ -2872,15 +2936,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
                 meta_info["input_top_logprobs"] = state.input_top_logprobs
-            if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
-                state.output_top_logprobs.extend(
-                    self.detokenize_top_logprobs_tokens(
-                        state.output_top_logprobs_val[len(state.output_top_logprobs) :],
-                        state.output_top_logprobs_idx[len(state.output_top_logprobs) :],
-                        return_text_in_logprobs,
+            if getattr(state.obj, "return_output_top_logprobs_b64", False):
+                # Non-streaming only (validated on input): encode once, when
+                # the response is actually returned.
+                if finished:
+                    meta_info.update(
+                        _build_output_top_logprobs_b64_fields(
+                            state.output_top_logprobs_chunks, top_logprobs_num
+                        )
                     )
-                )
-            meta_info["output_top_logprobs"] = state.output_top_logprobs
+            else:
+                if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
+                    state.output_top_logprobs.extend(
+                        self.detokenize_top_logprobs_tokens(
+                            state.output_top_logprobs_val[
+                                len(state.output_top_logprobs) :
+                            ],
+                            state.output_top_logprobs_idx[
+                                len(state.output_top_logprobs) :
+                            ],
+                            return_text_in_logprobs,
+                        )
+                    )
+                meta_info["output_top_logprobs"] = state.output_top_logprobs
 
         # 3. Handle token_ids_logprob
         if token_ids_logprob is not None:
@@ -2969,12 +3047,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.input_top_logprobs_flat_null_prefix[recv_obj_index],
                 )
             if recv_obj.output_top_logprobs_val is not None:
-                state.output_top_logprobs_val.extend(
-                    recv_obj.output_top_logprobs_val[recv_obj_index]
-                )
-                state.output_top_logprobs_idx.extend(
-                    recv_obj.output_top_logprobs_idx[recv_obj_index]
-                )
+                values = recv_obj.output_top_logprobs_val[recv_obj_index]
+                indices = recv_obj.output_top_logprobs_idx[recv_obj_index]
+                if getattr(state.obj, "return_output_top_logprobs_b64", False):
+                    if len(values):
+                        state.output_top_logprobs_chunks.append(
+                            _dense_output_top_logprobs_chunk(
+                                values, indices, top_logprobs_num
+                            )
+                        )
+                else:
+                    if isinstance(values, np.ndarray):
+                        # Dense decode chunk from the scheduler.
+                        values = values.tolist()
+                        indices = indices.tolist()
+                    state.output_top_logprobs_val.extend(values)
+                    state.output_top_logprobs_idx.extend(indices)
 
         if token_ids_logprob is not None:
             if (
@@ -3001,6 +3089,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             state.obj.top_logprobs_num,
             state.obj.token_ids_logprob,
             return_text_in_logprobs,
+            finished=_is_output_finished(recv_obj, recv_obj_index),
         )
 
     def detokenize_logprob_tokens(

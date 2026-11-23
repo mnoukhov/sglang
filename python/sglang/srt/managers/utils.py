@@ -165,15 +165,19 @@ class GenerationBatchResult:
                 self.logits_output.input_token_logprobs = _async_d2h(
                     self.logits_output.input_token_logprobs
                 )
-            if self.logits_output.next_token_top_logprobs_val is not None:
+            top_values = self.logits_output.next_token_top_logprobs_val
+            top_indices = self.logits_output.next_token_top_logprobs_idx
+            if isinstance(top_values, torch.Tensor):
+                self.logits_output.next_token_top_logprobs_val = _async_d2h(top_values)
+                self.logits_output.next_token_top_logprobs_idx = _async_d2h(top_indices)
+            elif top_values is not None:
                 self.logits_output.next_token_top_logprobs_val = [
                     _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_top_logprobs_val
                 ]
-            if self.logits_output.next_token_top_logprobs_idx is not None:
                 self.logits_output.next_token_top_logprobs_idx = [
                     _async_d2h(x) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
+                    for x in top_indices
                 ]
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
                 self.logits_output.next_token_token_ids_logprobs_val = [

@@ -249,6 +249,13 @@ class GenerateReqInput:
     return_flat_raw_top_logprobs: bool = False
     # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
     return_flat_raw_top_logprobs_b64: bool = False
+    # Return generated-token top logprobs as two base64 little-endian arrays
+    # (``output_top_logprobs_val_b64`` float32 and ``output_top_logprobs_idx_b64``
+    # int32, both [rows, top_logprobs_num] with -inf / -1 padding) plus
+    # ``output_top_logprobs_shape``, instead of nested ``output_top_logprobs``.
+    # The arrays are built once, when the request finishes; streaming is not
+    # supported.
+    return_output_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -466,6 +473,10 @@ class GenerateReqInput:
         ):
             raise ValueError(
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
+            )
+        if self.return_output_top_logprobs_b64 and self.stream:
+            raise ValueError(
+                "return_output_top_logprobs_b64 does not support streaming output."
             )
 
     def _determine_batch_size(self):
@@ -970,6 +981,7 @@ class GenerateReqInput:
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
+            return_output_top_logprobs_b64=self.return_output_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
