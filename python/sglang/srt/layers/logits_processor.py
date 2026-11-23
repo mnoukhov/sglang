@@ -225,8 +225,8 @@ class LogitsProcessorOutput:
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: Optional[List] = None
-    next_token_top_logprobs_idx: Optional[List] = None
+    next_token_top_logprobs_val: Optional[List | torch.Tensor] = None
+    next_token_top_logprobs_idx: Optional[List | torch.Tensor] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
@@ -274,6 +274,19 @@ class LogitsProcessorOutput:
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
+
+    def finalize_output_top_logprobs(self) -> None:
+        values = self.next_token_top_logprobs_val
+        indices = self.next_token_top_logprobs_idx
+        if isinstance(values, torch.Tensor):
+            # Keep dense [batch, k] host matrices; each request then holds a
+            # row view instead of a fresh list of Python floats per token. The
+            # copies release the pinned staging buffers.
+            self.next_token_top_logprobs_val = values.numpy().copy()
+            self.next_token_top_logprobs_idx = indices.numpy().copy()
+        elif values:
+            self.next_token_top_logprobs_val = [row.tolist() for row in values]
+            self.next_token_top_logprobs_idx = [row.tolist() for row in indices]
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
